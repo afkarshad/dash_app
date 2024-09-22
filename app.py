@@ -6,6 +6,8 @@ df = pd.read_csv('https://raw.githubusercontent.com/afkarshad/dash_app/refs/head
 
 app = Dash(__name__)
 
+server = app.server
+
 app.layout = html.Div([
     html.Div(children='My First App with Data'),
     dash_table.DataTable(data=df.to_dict('records'), page_size=10)

@@ -65,6 +65,7 @@ exclude_cols = ["day", "month", "year", "year_month", "y_m_d"]
 metrics_options = ["Monthly Active Users", "Daily Active Users", "Monthly Revenue", "Daily Revenue"]
 
 app = Dash(__name__, suppress_callback_exceptions=True)
+server = app.server
 
 app.layout = html.Div([
     html.H1('Dashboard'),

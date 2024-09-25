@@ -3,7 +3,6 @@ from dash.exceptions import PreventUpdate
 import plotly.express as px
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import calendar
 import math
 

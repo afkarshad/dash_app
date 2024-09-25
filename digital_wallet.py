@@ -2,9 +2,32 @@ from dash import Dash, html, dcc, callback, Output, Input, State, dash_table, AL
 from dash.exceptions import PreventUpdate
 import plotly.express as px
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import calendar
 import math
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_score, recall_score, f1_score
+import xgboost as xgb
+
+def calc_metrics(model, X, y_true):
+    y_pred = model.predict(X)
+    prec = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    return prec, recall, f1
+
+
+def train_eval_model(X, y, estimator, test_size=.2, seed=0):
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=seed, stratify=y)
+    
+    model = estimator.fit(X_train, y_train)
+    tp, tr, tf = calc_metrics(model, X_train, y_train)
+    ttp, ttr, ttf = calc_metrics(model, X_test, y_test)
+
+    return tp, tr, tf, ttp, ttr, ttf
 
 def generate_spend(row):
     return max(0, (row.product_amount + row.transaction_fee - row.cashback))
@@ -18,6 +41,70 @@ def preprocess_df(df):
     _df["y_m_d"] = _df.apply(lambda x: "{}/{:02d}".format(x.year_month, x.day), axis=1)
     _df["spend"] = _df.apply(lambda x: generate_spend(x), axis=1)
     return _df
+
+
+def normalize_string_value(df, cols):
+    _df = df.copy()
+    for c in cols:
+        _df[c] = _df[c].apply(lambda x: "_".join(x.lower().split()))
+    return _df
+
+def apply_log(df_temp, cols):
+    _df = df_temp.copy()
+    for c in cols:
+        _name = f"{c}_log"
+        _df[_name] = _df[c].apply(lambda x: math.log(x+.001))
+    return _df
+
+
+def generate_dataset(df, init_cols):
+    df_recent_trx = df.groupby("user_id")["year_month"].max().reset_index()
+    df_recent_trx[df_recent_trx["year_month"]>="2024/06"]
+    df_recent_trx[df_recent_trx["year_month"]<="2023/12"]
+
+    stay_users = df_recent_trx[df_recent_trx["year_month"]>="2024/06"]["user_id"].values.tolist()
+    churn_users = df_recent_trx[df_recent_trx["year_month"]<="2023/12"]["user_id"].values.tolist()
+
+    norm_cols = ["payment_method", "transaction_status", "device_type", "location"]
+    df_sub = df[df["user_id"].isin(stay_users+churn_users)]
+    df_sub = normalize_string_value(df_sub, norm_cols)
+    
+    df_sub_dummies = pd.get_dummies(
+        df_sub,
+        columns=norm_cols,
+        dtype=float
+    )
+
+    df_gr = df_sub_dummies.groupby("user_id").agg({
+        "product_category": pd.Series.nunique,
+        "spend": ["sum", pd.Series.mean, pd.Series.median],
+        "loyalty_points": "sum",
+        "payment_method_bank_transfer": ["max", "sum"],
+        "payment_method_credit_card": ["max", "sum"],
+        "payment_method_debit_card": ["max", "sum"],
+        "payment_method_upi": ["max", "sum"],
+        "payment_method_wallet_balance": ["max", "sum"],
+        "transaction_status_failed": ["max", "sum"],
+        "transaction_status_pending": ["max", "sum"],
+        "transaction_status_successful": ["max", "sum"],
+        "device_type_android": "max",
+        "device_type_ios": "max",
+        "device_type_web": "max",
+        "location_rural": ["max", "sum"],
+        "location_suburban": ["max", "sum"],
+        "location_urban": ["max", "sum"]
+    }).reset_index()
+
+    temp_cols = df_gr.columns
+    df_gr.columns = [f"{c1}_{c2}" if c2 != "" else f"{c1}" for c1, c2 in temp_cols]
+
+    dff = apply_log(df_gr, init_cols)
+    dff["is_churn"] = np.where(df_gr["user_id"].isin(stay_users), 0, 1)
+
+    label = dff["is_churn"]
+    features = dff.drop(["user_id", "is_churn"], axis=1)
+
+    return features, label
 
 
 def map_month(val, reverse=False):
@@ -39,6 +126,13 @@ def spawn_dropdown(value):
         dcc.Dropdown(df[value].unique(), id={"type": "filter-dropdown", "index": trend_cols.index(value)})
     ], style={"width": "15%", 'display': 'inline-block',
               'margin-right': 10})
+
+def print_metrics(model, X, y_true):
+    y_pred = model.predict(X)
+    prec = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    print(prec, recall, f1)
 
 
 df = pd.read_csv('https://raw.githubusercontent.com/afkarshad/dash_app/refs/heads/main/digital_wallet_transactions.csv')
@@ -63,6 +157,21 @@ avg_daily_trx = format(math.floor(daily_trx["spend"].mean()),",")
 
 exclude_cols = ["day", "month", "year", "year_month", "y_m_d"]
 metrics_options = ["Monthly Active Users", "Daily Active Users", "Monthly Revenue", "Daily Revenue"]
+
+init_cols = ["spend_sum", "spend_median", "spend_mean", "loyalty_points_sum"]
+log_cols = [f"{c}_log" for c in init_cols]
+
+features, labels = generate_dataset(df, init_cols)
+all_features = features.columns
+cols_set_1 = [c for c in features.columns if c not in log_cols]
+cols_set_2 = [c for c in features.columns if c not in init_cols]
+cols_set_3 = log_cols
+
+d_map_feats = {
+    "features set 1": cols_set_1,
+    "features set 2": cols_set_2,
+    "features set 3": cols_set_3
+}
 
 app = Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
@@ -156,7 +265,8 @@ app.layout = html.Div([
     html.Div([
         html.Div([
             dcc.Dropdown(metrics_options, metrics_options[0],
-                         id='dropdown-metrics')
+                         id='dropdown-metrics',
+                         clearable=False)
         ], style={"width": "30%"}),
         dcc.Graph(id="graph-metrics")
     ]),
@@ -168,7 +278,8 @@ app.layout = html.Div([
         html.Div([
             html.Div("Filter"),
             dcc.Dropdown(trend_cols, trend_cols[0],
-                         id='dropdown-trend-filter')
+                         id='dropdown-trend-filter',
+                         clearable=False)
         ], style={"width": "30%"}),
 
         html.Div(id="graph-div"),
@@ -180,8 +291,155 @@ app.layout = html.Div([
                          multi=True)
         ], style={"width": "30%"}),
         html.Div(id="dropdown-trend-filter-selector")
+    ]),
+    html.Hr(),
+
+    html.H2("Churn Prediction Model Training"),
+
+    html.Div([
+        html.Div([
+            html.Div([
+                dcc.Dropdown(
+                    ["feature set 1","feature set 2","feature set 3","custom"],
+                    "feature set 1",
+                    id="feature-selector",
+                    clearable=False
+                )
+            ], style={"width": "10%", "display": "inline-block",
+                      "margin-right": 10}),
+            
+            html.Div([
+                html.Div("test size:"),
+                dcc.Input(
+                    id="input-test-size",
+                    type="number",
+                    value=0.2
+                )
+            ], style={"width": "10%", "display": "inline-block",
+                      "margin-right": 10}),
+
+            html.Div([
+                html.Div("learning rate:"),
+                dcc.Input(
+                    id="input-eta",
+                    type="number",
+                    value=1e-1
+                )
+            ], style={"width": "10%", "display": "inline-block",
+                      "margin-right": 10}),
+
+            html.Div([
+                html.Div("max tree depth:"),
+                dcc.Input(
+                    id="input-tree-depth",
+                    type="number",
+                    value=6
+                )
+            ], style={"width": "10%", "display": "inline-block",
+                      "margin-right": 10}),
+
+            html.Div([
+                html.Button("Sumbit training", id="btn-train")
+            ], style={"width": "10%", "display": "inline-block",
+                      "margin-right": 10}),
+        ]),
+
+        html.Div([
+            html.Div([
+                dcc.Checklist(id="feature-checklist")
+            ], style={"width": "20%", "height": 300,
+                      "overflowY": "scroll", "display": "inline-block",
+                      "margin-right": 10}),
+
+            html.Div([
+                html.H3("Evaluation on Training Data"),
+                html.Div([
+                    html.Div([
+                        html.H4("Precision"),
+                        html.H2(id="train-prec-score")
+                    ], style={"width": "15%", 'display': 'inline-block',
+                              'margin-right': 10, "textAlign": "center"}),
+                    html.Div([
+                        html.H4("Recall"),
+                        html.H2(id="train-rec-score")
+                    ], style={"width": "15%", 'display': 'inline-block',
+                              'margin-right': 10, "textAlign": "center"}),
+                    html.Div([
+                        html.H4("F1 Score"),
+                        html.H2(id="train-f1-score")
+                    ], style={"width": "15%", 'display': 'inline-block',
+                              'margin-right': 10, "textAlign": "center"}),
+                ]),
+                html.H3("Evaluation on Testing Data"),
+                html.Div([
+                    html.Div([
+                        html.H4("Precision"),
+                        html.H2(id="test-prec-score")
+                    ], style={"width": "15%", 'display': 'inline-block',
+                              'margin-right': 10, "textAlign": "center"}),
+                    html.Div([
+                        html.H4("Recall"),
+                        html.H2(id="test-rec-score")
+                    ], style={"width": "15%", 'display': 'inline-block',
+                              'margin-right': 10, "textAlign": "center"}),
+                    html.Div([
+                        html.H4("F1 Score"),
+                        html.H2(id="test-f1-score")
+                    ], style={"width": "15%", 'display': 'inline-block',
+                              'margin-right': 10, "textAlign": "center"}),
+                ])
+            ], style={"width": "60%", "display": "inline-block",
+                      "margin-right": 10})
+        ])
     ])
 ])
+
+btn_train = 0
+@callback(
+    Output('train-prec-score', 'children'),
+    Output('train-rec-score', 'children'),
+    Output('train-f1-score', 'children'),
+    Output('test-prec-score', 'children'),
+    Output('test-rec-score', 'children'),
+    Output('test-f1-score', 'children'),
+    Input('btn-train', 'n_clicks'),
+    State("feature-checklist", "value"),
+    State("input-test-size", "value"),
+    State("input-eta", "value"),
+    State("input-tree-depth", "value"),
+    prevent_initial_call=True
+)
+def train_model(cl, f, ts, lr, dp):
+    if cl is not None:
+        global btn_train
+        if cl != btn_train:
+            btn_train = cl
+            X = features[f].copy()
+            y = labels
+            clf = xgb.XGBClassifier(eta=lr, max_depth=dp)
+            metrics = train_eval_model(X, y, clf, test_size=ts, seed=4)
+            percent = ["{:.2f}%".format(m*100) for m in list(metrics)]
+            return percent
+    else:
+        raise PreventUpdate
+
+@callback(
+    Output('feature-checklist', 'options'),
+    Output('feature-checklist', 'value'),
+    Input('feature-selector', 'value')
+)
+def update_data(value):
+    d = [{"label": c, "value":c, "disabled":True}
+         for c in all_features]
+    if value == "custom":
+        return all_features, []
+    elif value == "feature set 1":
+        v = cols_set_1
+    elif value == "feature set 2":
+        v = cols_set_2
+    elif value == "feature set 3":
+        v = cols_set_3
+    return d,v
 
 vis_tracker=0
 @callback(
